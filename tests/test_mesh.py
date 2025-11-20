@@ -223,9 +223,87 @@ def mesh_module(monkeypatch):
     sys.modules.pop(module_name, None)
 
 
+def test_subscribe_receive_topics_covers_all_handlers(mesh_module, monkeypatch):
+    mesh = mesh_module
+    daemon_mod = sys.modules["data.mesh_ingestor.daemon"]
+
+    recorded_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    class RecordingPub:
+        def subscribe(self, *args, **kwargs):
+            recorded_calls.append((args, kwargs))
+
+    monkeypatch.setattr(daemon_mod, "pub", RecordingPub())
+
+    subscribed_topics = mesh._subscribe_receive_topics()
+
+    expected_topics = list(mesh._RECEIVE_TOPICS)
+    assert subscribed_topics == expected_topics
+    assert len(recorded_calls) == len(expected_topics)
+
+    for (args, kwargs), topic in zip(recorded_calls, expected_topics):
+        assert not kwargs
+        assert args[0] is mesh.on_receive
+        assert args[1] == topic
+
+
 def test_snapshot_interval_defaults_to_60_seconds(mesh_module):
     mesh = mesh_module
     assert mesh.SNAPSHOT_SECS == 60
+
+
+def test_extract_host_node_id_prefers_my_info_fields(mesh_module):
+    mesh = mesh_module
+
+    class DummyInterface:
+        def __init__(self):
+            self.myInfo = {"my_node_num": 0x9E95CF60}
+
+    iface = DummyInterface()
+
+    assert mesh._extract_host_node_id(iface) == "!9e95cf60"
+
+
+def test_extract_host_node_id_from_nested_info(mesh_module):
+    mesh = mesh_module
+
+    class DummyInterface:
+        def __init__(self):
+            self.myInfo = {"info": {"id": "!cafebabe"}}
+
+    iface = DummyInterface()
+
+    assert mesh._extract_host_node_id(iface) == "!cafebabe"
+
+
+def test_extract_host_node_id_from_callable(mesh_module):
+    mesh = mesh_module
+
+    class CallableNoDict:
+        __slots__ = ()
+
+        def __call__(self):
+            return {"id": "!f00ba4"}
+
+    class DummyInterface:
+        def __init__(self):
+            self.localNode = CallableNoDict()
+
+    iface = DummyInterface()
+
+    assert mesh._extract_host_node_id(iface) == "!00f00ba4"
+
+
+def test_extract_host_node_id_from_my_node_num_attribute(mesh_module):
+    mesh = mesh_module
+
+    class DummyInterface:
+        def __init__(self):
+            self.myNodeNum = 0xDEADBEEF
+
+    iface = DummyInterface()
+
+    assert mesh._extract_host_node_id(iface) == "!deadbeef"
 
 
 @pytest.mark.parametrize("value", ["mock", "Mock", " disabled "])
@@ -1976,6 +2054,160 @@ def test_store_packet_dict_handles_environment_telemetry(mesh_module, monkeypatc
     assert payload["soil_temperature"] == pytest.approx(18.9)
     assert payload["lora_freq"] == 868
     assert payload["modem_preset"] == "MediumFast"
+
+
+def test_store_packet_dict_throttles_host_telemetry(mesh_module, monkeypatch):
+    mesh = mesh_module
+    captured = []
+    logs = []
+    monkeypatch.setattr(
+        mesh,
+        "_queue_post_json",
+        lambda path, payload, *, priority: captured.append((path, payload, priority)),
+    )
+    monkeypatch.setattr(
+        mesh.config,
+        "_debug_log",
+        lambda message, **metadata: logs.append((message, metadata)),
+    )
+
+    mesh.register_host_node_id("!9e95cf60")
+
+    base_packet = {
+        "id": 1_234,
+        "fromId": "!9e95cf60",
+        "decoded": {
+            "portnum": "TELEMETRY_APP",
+            "telemetry": {
+                "time": 1_000,
+                "deviceMetrics": {
+                    "batteryLevel": 50,
+                },
+            },
+        },
+    }
+
+    mesh.store_packet_dict({**base_packet, "rxTime": 1_000})
+    mesh.store_packet_dict({**base_packet, "id": 1_235, "rxTime": 1_300})
+    mesh.store_packet_dict({**base_packet, "id": 1_236, "rxTime": 4_700})
+
+    assert len(captured) == 2
+    first_path, first_payload, _ = captured[0]
+    second_path, second_payload, _ = captured[1]
+    assert first_path == "/api/telemetry"
+    assert second_path == "/api/telemetry"
+    assert first_payload["id"] == 1_234
+    assert second_payload["id"] == 1_236
+
+    suppression_logs = [
+        entry for entry in logs if entry[0] == "Suppressed host telemetry update"
+    ]
+    assert suppression_logs
+    assert suppression_logs[0][1]["host_node_id"] == "!9e95cf60"
+    assert suppression_logs[0][1]["minutes_remaining"] == 55
+
+
+def test_store_packet_dict_handles_traceroute_packet(mesh_module, monkeypatch):
+    mesh = mesh_module
+    captured = []
+    monkeypatch.setattr(
+        mesh,
+        "_queue_post_json",
+        lambda path, payload, *, priority: captured.append((path, payload, priority)),
+    )
+
+    mesh.config.LORA_FREQ = 915
+    mesh.config.MODEM_PRESET = "LongFast"
+
+    packet = {
+        "id": 2_934_054_466,
+        "rxTime": 1_763_183_133,
+        "rssi": -70,
+        "snr": 10.25,
+        "fromId": "3664074452",
+        "decoded": {
+            "portnum": "PAXCOUNTER_APP",
+            "dest": "2660618080",
+            "traceroute": {
+                "requestId": 17,
+                "route": [3_663_643_096, "!beadf00d", "c0ffee99", 1_150_717_793],
+                "snrTowards": [42, -14, 41],
+            },
+        },
+    }
+
+    mesh.store_packet_dict(packet)
+
+    assert captured
+    path, payload, priority = captured[0]
+    assert path == "/api/traces"
+    assert priority == mesh._TRACE_POST_PRIORITY
+    assert payload["id"] == packet["id"]
+    assert payload["request_id"] == 17
+    assert payload["src"] == 3_664_074_452
+    assert payload["dest"] == 2_660_618_080
+    assert payload["rx_time"] == 1_763_183_133
+    assert payload["rx_iso"] == "2025-11-15T05:05:33Z"
+    assert payload["hops"] == [
+        3_663_643_096,
+        3_199_070_221,
+        3_237_998_233,
+        1_150_717_793,
+    ]
+    assert payload["rssi"] == -70
+    assert payload["snr"] == pytest.approx(10.25)
+    assert "elapsed_ms" in payload
+    assert payload["lora_freq"] == 915
+    assert payload["modem_preset"] == "LongFast"
+
+
+def test_traceroute_hop_normalization_supports_mappings(mesh_module, monkeypatch):
+    mesh = mesh_module
+    captured = []
+    monkeypatch.setattr(
+        mesh,
+        "_queue_post_json",
+        lambda path, payload, *, priority: captured.append((path, payload, priority)),
+    )
+
+    packet = {
+        "id": 1_111,
+        "decoded": {
+            "portnum": "TRACEROUTE_APP",
+            "traceroute": {
+                "requestId": 42,
+                "route": [{"node_id": "!beadf00d"}, {"num": "0xc0ffee99"}, {"id": 123}],
+            },
+        },
+    }
+
+    mesh.store_packet_dict(packet)
+
+    assert captured
+    _, payload, _ = captured[0]
+    assert payload["hops"] == [0xBEADF00D, 0xC0FFEE99, 123]
+
+
+def test_traceroute_packet_without_identifiers_is_ignored(mesh_module, monkeypatch):
+    mesh = mesh_module
+    captured = []
+    monkeypatch.setattr(
+        mesh,
+        "_queue_post_json",
+        lambda path, payload, *, priority: captured.append((path, payload, priority)),
+    )
+
+    packet = {
+        "decoded": {
+            "portnum": "TRACEROUTE_APP",
+            "traceroute": {},
+        },
+        "rxTime": 123,
+    }
+
+    mesh.store_packet_dict(packet)
+
+    assert captured == []
 
 
 def test_post_queue_prioritises_messages(mesh_module, monkeypatch):

@@ -20,6 +20,7 @@ import contextlib
 import glob
 import importlib
 import ipaddress
+import math
 import re
 import sys
 import urllib.parse
@@ -48,16 +49,37 @@ def _ensure_mapping(value) -> Mapping | None:
     return None
 
 
+def _is_nodeish_identifier(value: Any) -> bool:
+    """Return ``True`` when ``value`` resembles a Meshtastic node identifier."""
+
+    if isinstance(value, (int, float)):
+        return False
+    if not isinstance(value, str):
+        return False
+
+    trimmed = value.strip()
+    if not trimmed:
+        return False
+    if trimmed.startswith("^"):
+        return True
+    if trimmed.startswith("!"):
+        trimmed = trimmed[1:]
+    elif trimmed.lower().startswith("0x"):
+        trimmed = trimmed[2:]
+    elif not re.search(r"[a-fA-F]", trimmed):
+        # Bare decimal strings should not be treated as node ids when labelled "id".
+        return False
+
+    return bool(re.fullmatch(r"[0-9a-fA-F]{1,8}", trimmed))
+
+
 def _candidate_node_id(mapping: Mapping | None) -> str | None:
     """Extract a canonical node identifier from ``mapping`` when present."""
 
     if mapping is None:
         return None
 
-    primary_keys = (
-        "id",
-        "userId",
-        "user_id",
+    node_keys = (
         "fromId",
         "from_id",
         "from",
@@ -66,19 +88,34 @@ def _candidate_node_id(mapping: Mapping | None) -> str | None:
         "nodeNum",
         "node_num",
         "num",
+        "userId",
+        "user_id",
     )
 
-    for key in primary_keys:
+    for key in node_keys:
         with contextlib.suppress(Exception):
             node_id = serialization._canonical_node_id(mapping.get(key))
             if node_id:
                 return node_id
 
+    with contextlib.suppress(Exception):
+        value = mapping.get("id")
+        if _is_nodeish_identifier(value):
+            node_id = serialization._canonical_node_id(value)
+            if node_id:
+                return node_id
+
     user_section = _ensure_mapping(mapping.get("user"))
     if user_section is not None:
-        for key in ("id", "userId", "user_id", "num", "nodeNum", "node_num"):
+        for key in ("userId", "user_id", "num", "nodeNum", "node_num"):
             with contextlib.suppress(Exception):
                 node_id = serialization._canonical_node_id(user_section.get(key))
+                if node_id:
+                    return node_id
+        with contextlib.suppress(Exception):
+            user_id_value = user_section.get("id")
+            if _is_nodeish_identifier(user_id_value):
+                node_id = serialization._canonical_node_id(user_id_value)
                 if node_id:
                     return node_id
 
@@ -109,6 +146,47 @@ def _candidate_node_id(mapping: Mapping | None) -> str | None:
             node_id = _candidate_node_id(_ensure_mapping(value))
             if node_id:
                 return node_id
+
+    return None
+
+
+def _extract_host_node_id(iface) -> str | None:
+    """Return the canonical node identifier for the connected host device."""
+
+    if iface is None:
+        return None
+
+    def _as_mapping(candidate) -> Mapping | None:
+        mapping = _ensure_mapping(candidate)
+        if mapping is not None:
+            return mapping
+        if callable(candidate):
+            with contextlib.suppress(Exception):
+                return _ensure_mapping(candidate())
+        return None
+
+    candidates: list[Mapping] = []
+    for attr in ("myInfo", "my_node_info", "myNodeInfo", "my_node", "localNode"):
+        mapping = _as_mapping(getattr(iface, attr, None))
+        if mapping is None:
+            continue
+        candidates.append(mapping)
+        nested_info = _ensure_mapping(mapping.get("info"))
+        if nested_info:
+            candidates.append(nested_info)
+
+    for mapping in candidates:
+        node_id = _candidate_node_id(mapping)
+        if node_id:
+            return node_id
+        for key in ("myNodeNum", "my_node_num", "myNodeId", "my_node_id"):
+            node_id = serialization._canonical_node_id(mapping.get(key))
+            if node_id:
+                return node_id
+
+    node_id = serialization._canonical_node_id(getattr(iface, "myNodeNum", None))
+    if node_id:
+        return node_id
 
     return None
 
@@ -394,11 +472,24 @@ def _resolve_lora_message(local_config: Any) -> Any | None:
     return None
 
 
-def _region_frequency(lora_message: Any) -> int | None:
-    """Derive the LoRa region frequency in MHz from ``lora_message``."""
+def _region_frequency(lora_message: Any) -> int | float | str | None:
+    """Derive the LoRa region frequency in MHz or the region label from ``lora_message``.
+
+    Numeric override values are floored to the nearest MHz to align with the
+    integer frequencies expected elsewhere in the ingestion pipeline.
+    """
 
     if lora_message is None:
         return None
+
+    override_frequency = getattr(lora_message, "override_frequency", None)
+    if override_frequency is not None:
+        if isinstance(override_frequency, (int, float)):
+            if override_frequency > 0:
+                return math.floor(override_frequency)
+        elif override_frequency:
+            return override_frequency
+
     region_value = getattr(lora_message, "region", None)
     if region_value is None:
         return None
@@ -417,7 +508,10 @@ def _region_frequency(lora_message: Any) -> int | None:
                 return int(token)
             except ValueError:  # pragma: no cover - defensive only
                 continue
+        return enum_name
     if isinstance(region_value, int) and region_value >= 100:
+        return region_value
+    if isinstance(region_value, str) and region_value:
         return region_value
     return None
 
@@ -771,6 +865,7 @@ __all__ = [
     "NoAvailableMeshInterface",
     "_ensure_channel_metadata",
     "_ensure_radio_metadata",
+    "_extract_host_node_id",
     "_DummySerialInterface",
     "_DEFAULT_TCP_PORT",
     "_DEFAULT_TCP_TARGET",

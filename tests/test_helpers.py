@@ -134,6 +134,22 @@ def test_candidate_node_id_and_normaliser():
     node_id = interfaces._candidate_node_id(nested)
     assert node_id == "!0000002a"
 
+    telemetry_packet = {"id": 123456, "from": "!0000000b"}
+    node_id = interfaces._candidate_node_id(telemetry_packet)
+    assert node_id == "!0000000b"
+
+    unknown_packet = {"id": "123456"}
+    assert interfaces._candidate_node_id(unknown_packet) is None
+
+    preferred_hex_packet = {"id": "0x2a"}
+    assert interfaces._candidate_node_id(preferred_hex_packet) == "!0000002a"
+
+    caret_alias_packet = {"id": "^abc"}
+    assert interfaces._candidate_node_id(caret_alias_packet) == "^abc"
+
+    non_node_numeric = {"id": 42.0}
+    assert interfaces._candidate_node_id(non_node_numeric) is None
+
     packet = {"user": {"id": "!0000002a"}, "userId": None}
     normalised = interfaces._normalise_nodeinfo_packet(packet)
     assert normalised["id"] == "!0000002a"
@@ -189,7 +205,10 @@ def test_region_frequency_and_resolution_helpers():
 
     class EnumType:
         def __init__(self):
-            self.values_by_number = {1: EnumValue("REGION_915")}
+            self.values_by_number = {
+                1: EnumValue("REGION_915"),
+                2: EnumValue("US"),
+            }
 
     class FieldDesc:
         def __init__(self):
@@ -200,12 +219,32 @@ def test_region_frequency_and_resolution_helpers():
             self.fields_by_name = {"region": FieldDesc()}
 
     class LoraMessage:
-        def __init__(self, region):
+        def __init__(self, region, override_frequency=None):
             self.region = region
+            self.override_frequency = override_frequency
             self.DESCRIPTOR = Descriptor()
 
     freq = interfaces._region_frequency(LoraMessage(1))
     assert freq == 915
+
+    freq = interfaces._region_frequency(LoraMessage(1, override_frequency=0))
+    assert freq == 915
+
+    freq = interfaces._region_frequency(LoraMessage(1, override_frequency=921.5))
+    assert freq == 921
+
+    freq = interfaces._region_frequency(LoraMessage(1, override_frequency="915MHz"))
+    assert freq == "915MHz"
+
+    freq = interfaces._region_frequency(LoraMessage(2))
+    assert freq == "US"
+
+    class StringRegionMessage:
+        def __init__(self, region):
+            self.region = region
+
+    freq = interfaces._region_frequency(StringRegionMessage("EU"))
+    assert freq == "EU"
 
     class LocalConfig:
         def __init__(self, lora):
